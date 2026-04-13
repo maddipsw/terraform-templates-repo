@@ -1,0 +1,196 @@
+name: terraform-plan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "applications/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: terraform-plan-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-app:
+    runs-on: ubuntu-latest
+    outputs:
+      app_name: ${{ steps.resolve.outputs.app_name }}
+      app_dir: ${{ steps.resolve.outputs.app_dir }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Resolve app from latest commit message
+        id: resolve
+        shell: bash
+        run: |
+          commit_message="$(git log -1 --pretty=%B)"
+          echo "Latest commit message:"
+          echo "$commit_message"
+
+          if [[ "$commit_message" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
+            app_name="${BASH_REMATCH[1]}"
+          else
+            echo "ERROR: Commit message must include application name in the format - [Application:<app-name>]"
+            exit 1
+          fi
+
+          if [[ "$commit_message" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
+            region="${BASH_REMATCH[1]}"
+          else
+            echo "ERROR: Commit message must include Region details in the format - [Region:<us-east-2/us-east-1>]"
+            exit 1
+          fi
+
+          app_dir="applications/${app_name}/${region}"
+
+          if [ ! -d "$app_dir" ]; then
+            echo "ERROR: Directory not found: $app_dir"
+            exit 1
+          fi
+
+          echo "app_name=$app_name" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "app_dir=$app_dir" >> "$GITHUB_OUTPUT"
+
+  terraform_plan:
+    name: Terraform Plan
+    needs: resolve-app
+    if: needs.resolve-app.outputs.app_name != ''
+    environment: non-production
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ needs.resolve-app.outputs.app_dir }}
+
+    env:
+      TF_IN_AUTOMATION: "true"
+      AWS_REGION: ${{ needs.resolve-app.outputs.region }}
+      TFPLAN: ${{ needs.resolve-app.outputs.app_name }}.tfplan
+#      TF_VAR_AWS_REGION: ${{ needs.resolve-app.outputs.region }}
+#      TF_VAR_key_name: ${{ vars.KEY_NAME }}
+#      TF_VAR_iam_instance_profile: ${{ vars.IAM_INSTANCE_PROFILE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+            app-id: ${{ secrets.APP_ID }}
+            private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Configure Git for private module access
+        shell: bash
+        run: |
+          git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/maddipsw/".insteadOf "https://github.com/maddipsw/"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+          aws-region: us-east-2
+          audience: "sts.amazonaws.com"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.1"
+
+      - name: Configure Git for private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
+          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Terraform fmt (check only)
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -input=false -no-color
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: tfplan
+        run: |
+            set +e
+            terraform plan -input=false -no-color -detailed-exitcode -out=tfplan > plan.txt 2>&1
+            exit_code=$?
+            set -e
+                
+            echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+            
+            if [ "$exit_code" -eq 0 ]; then
+            echo "status=No changes" >> "$GITHUB_OUTPUT"
+            elif [ "$exit_code" -eq 2 ]; then
+            echo "status=Changes detected" >> "$GITHUB_OUTPUT"
+            else
+            echo "status=Plan failed" >> "$GITHUB_OUTPUT"
+            fi
+
+      - name: Build PR comment
+        id: comment
+        run: |
+                {
+                  echo 'body<<EOF'
+                  echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
+                  echo "## Terraform plan - ${{ needs.resolve-app.outputs.app_name }}"
+                  echo ""
+                  echo "- Status: **${{ steps.tfplan.outputs.status }}**"
+                  echo "- Directory: \`${{ needs.resolve-app.outputs.app_dir }}\`"
+                  echo "- Commit: \`${{ github.event.pull_request.head.sha }}\`"
+                  echo ""
+                  echo "<details><summary>Show plan output</summary>"
+                  echo ""
+                  echo '```text'
+                  sed -n '1,60000p' plan.txt
+                  echo '```'
+                  echo ""
+                  echo "</details>"
+                  echo 'EOF'
+                } >> "$GITHUB_OUTPUT"
+
+      - name: Find existing sticky comment
+        id: find_comment
+        uses: peter-evans/find-comment@v3
+        with:
+             issue-number: ${{ github.event.pull_request.number }}
+             comment-author: "github-actions[bot]"
+             body-includes: "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
+
+      - name: Create or update sticky comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+             issue-number: ${{ github.event.pull_request.number }}
+             comment-id: ${{ steps.find_comment.outputs.comment-id }}
+             body: ${{ steps.comment.outputs.body }}
+             edit-mode: replace
+
+      - name: Fail workflow if plan failed
+        if: steps.tfplan.outputs.exit_code == '1'
+        run: exit 1
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: v2-workload-accounts/FHS-SBX-INFRA001/ec2/us-east-2/a2niacdemo-v8/a2niacdemo-v8.tfplan
+          retention-days: 5
+
