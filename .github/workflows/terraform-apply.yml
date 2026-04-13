@@ -1,0 +1,569 @@
+name: terraform-apply
+
+on:
+  pull_request:
+    types: [ closed ]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  resolve-app:
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      app_name: ${{ steps.resolve.outputs.app_name }}
+      app_dir: ${{ steps.resolve.outputs.app_dir }}
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Resolve app from latest commit message
+        id: resolve
+        shell: bash
+        run: |
+          commit_message="$(git log -1 --pretty=%B)"
+          echo "Latest commit message:"
+          echo "$commit_message"
+
+          if [[ "$commit_message" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
+            app_name="${BASH_REMATCH[1]}"
+          else
+            echo "ERROR: Commit message must include application name in the format - [Application:<app-name>]"
+            exit 1
+          fi
+
+          if [[ "$commit_message" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
+            region="${BASH_REMATCH[1]}"
+          else
+            echo "ERROR: Commit message must include Region details in the format - [Region:<us-east-2/us-east-1>]"
+            exit 1
+          fi
+
+          app_dir="applications/${app_name}/${region}"
+
+          if [ ! -d "$app_dir" ]; then
+            echo "ERROR: Directory not found: $app_dir"
+            exit 1
+          fi
+
+          echo "app_name=$app_name" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "app_dir=$app_dir" >> "$GITHUB_OUTPUT"
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: resolve-app
+    if: needs.resolve-app.outputs.app_name != ''
+    concurrency:
+      group: terraform-apply-${{ needs.resolve-app.outputs.app_name }}
+      cancel-in-progress: false
+    environment: non-production
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ needs.resolve-app.outputs.app_dir }}
+
+    env:
+      TF_IN_AUTOMATION: "true"
+      AWS_REGION: ${{ needs.resolve-app.outputs.region }}
+      TFPLAN: ${{ needs.resolve-app.outputs.app_name }}.tfplan
+      #      TF_VAR_AWS_REGION: ${{ needs.resolve-app.outputs.region }}
+      #      TF_VAR_key_name: ${{ vars.KEY_NAME }}
+      #      TF_VAR_iam_instance_profile: ${{ vars.IAM_INSTANCE_PROFILE }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456780:role/github-actions-oidc-role
+          aws-region: us-east-2
+          audience: "sts.amazonaws.com"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.1"
+
+      - name: Configure Git for private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
+          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Terraform fmt (check only)
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -input=false -no-color
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      # Capture current instance_ids BEFORE apply (baseline).
+      # This is used so SSM docs run ONLY for new instances after apply.
+      - name: Capture pre-apply instance_ids (baseline)
+        run: |
+          set -euo pipefail
+          OLD=$(terraform output -json instance_ids 2>/dev/null || echo '[]')
+          echo "OLD_INSTANCE_IDS_JSON=$(echo "$OLD" | jq -c .)" >> "$GITHUB_ENV"
+          echo "Baseline instance_ids: $(echo "$OLD" | jq -c .)"
+
+      - name: Terraform Plan (for apply)
+        run: terraform plan -no-color -input=false -out="$TFPLAN" -var-file=${{ needs.resolve-app.outputs.app_name }}.tfvars
+
+      - name: Terraform Apply
+        run: terraform apply -no-color -input=false -auto-approve "$TFPLAN"
+
+          # -----------------------------
+          # Post-provisioning: SSM order (ONLY for new instances)
+          # 1) set-hostname-windows-v1 (reboots)
+          # 2) ad-join-v1 (with SCCM + Qualys + SolarWinds agents)
+          # -----------------------------
+
+      - name: Read Terraform output instance_ids (post-apply) and compute new instances
+        run: |
+              set -euo pipefail
+              NEW=$(terraform output -json instance_ids | jq -c .)
+              OLD=${OLD_INSTANCE_IDS_JSON:-"[]"}
+              NEW_ONLY=$(jq -n --argjson old "$OLD" --argjson new "$NEW" '
+                [ $new[] | select($old | index(.) | not) ]
+              ' | jq -c .)
+
+              echo "INSTANCE_IDS_JSON=$NEW" >> "$GITHUB_ENV"
+              echo "NEW_INSTANCE_IDS_JSON=$NEW_ONLY" >> "$GITHUB_ENV"
+
+              echo "Old IDs: $OLD"
+              echo "New IDs: $NEW"
+              echo "New-only IDs: $NEW_ONLY"
+
+      - name: Wait for EC2 instance status OK (new instances only)
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' | xargs || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+              echo "Waiting for EC2 instance-status-ok for: $IDS"
+              aws ec2 wait instance-status-ok --instance-ids $IDS
+
+      - name: Wait for SSM online (pre Doc1) - new instances only
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+
+              echo "🔍 Starting intelligent monitoring for SSM online detection..."
+              for id in $IDS; do
+                echo "Instance: $id"
+
+                ELAPSED=0
+                MAX_WAIT=600  # 10 minutes maximum for SSM to come online
+                CHECK_INTERVAL=15  # Start with 15-second intervals
+                EXTEND_THRESHOLD=300  # After 5 minutes, increase interval
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  status=$(aws ssm describe-instance-information \
+                    --filters "Key=InstanceIds,Values=$id" \
+                    --query "InstanceInformationList[0].PingStatus" \
+                    --output text 2>/dev/null || echo "Unknown")
+
+                  if [[ "$status" == "Online" ]]; then
+                    echo "✅ SSM online: $id (${ELAPSED}s elapsed)"
+                    break
+                  fi
+
+                  # Adaptive interval: longer waits after initial period  
+                  if [ $ELAPSED -gt $EXTEND_THRESHOLD ]; then
+                    CHECK_INTERVAL=30  # Switch to 30-second intervals after 5 minutes
+                  fi
+
+                  echo "⏳ SSM status: $status (${ELAPSED}s elapsed, checking every ${CHECK_INTERVAL}s)"
+                  sleep $CHECK_INTERVAL
+                  ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                done
+
+                if [[ "$status" != "Online" ]]; then
+                  echo "❌ ERROR: SSM did not come online for $id after ${ELAPSED}s"
+                  exit 1
+                fi
+              done
+
+      - name: Run SSM doc 1 - set-hostname-windows-v1 (new instances only)
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+
+              echo "Running set-hostname-windows-v1 on:"
+              echo "$IDS"
+
+              CMD_ID=$(aws ssm send-command \
+                --document-name "set-hostname-windows-v1" \
+                --instance-ids $(echo "$IDS" | xargs) \
+                --comment "GitHub Actions: set-hostname-windows-v1" \
+                --output json | jq -r '.Command.CommandId')
+
+              echo "CommandId: $CMD_ID"
+
+              # Smart monitoring approach: continuous status checking with adaptive intervals
+              for id in $IDS; do
+                echo "🔍 Starting intelligent monitoring for hostname setting on $id..."
+
+                ELAPSED=0
+                MAX_WAIT=1500  # 25 minutes maximum (document timeout is typically 25 min)
+                CHECK_INTERVAL=30  # Start with 30-second intervals
+                EXTEND_THRESHOLD=600  # After 10 minutes, increase interval
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --query 'Status' --output text 2>/dev/null || echo "Unknown")
+
+                  case "$STATUS" in
+                    "Success")
+                      echo "✅ Hostname setting completed successfully on $id (${ELAPSED}s elapsed)"
+                      break
+                      ;;
+                    "Failed"|"Cancelled"|"Cancelling"|"TimedOut")
+                      echo "❌ Hostname setting failed with status '$STATUS' on $id after ${ELAPSED}s"
+                      echo "📋 Retrieving detailed status for analysis..."
+                      aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --output json || echo "Could not retrieve details"
+                      echo "🧹 SSM document execution failed - triggering infrastructure cleanup..."
+                      terraform destroy -auto-approve -var-file=a2niacdemo-v8.tfvars
+                      exit 1
+                      ;;
+                    "InProgress"|"Pending"|"InProgressRecovered")
+                      # Adaptive interval: longer waits for longer-running operations
+                      if [ $ELAPSED -gt $EXTEND_THRESHOLD ]; then
+                        CHECK_INTERVAL=60  # Switch to 60-second intervals after 10 minutes
+                      fi
+                      echo "⏳ Hostname setting in progress on $id (${ELAPSED}s elapsed, checking every ${CHECK_INTERVAL}s)"
+                      sleep $CHECK_INTERVAL
+                      ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      ;;
+                    *)
+                      echo "❓ Unknown status '$STATUS' on $id (${ELAPSED}s elapsed), retrying in ${CHECK_INTERVAL}s..."
+                      sleep $CHECK_INTERVAL
+                      ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      ;;
+                  esac
+                done
+
+                # Final status report after monitoring period
+                if [ $ELAPSED -ge $MAX_WAIT ]; then
+                  FINAL_STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --query 'Status' --output text 2>/dev/null || echo "Unknown")
+                  echo "⏰ Hostname setting monitoring timeout reached for $id (25 minutes). Final status: $FINAL_STATUS"
+                  echo "❌ SSM document execution timeout - triggering infrastructure cleanup..."
+                  terraform destroy -auto-approve -var-file=a2niacdemo-v8.tfvars
+                  exit 1
+                fi
+
+                echo "📊 Hostname setting monitoring complete for $id - moving to next instance"
+              done
+
+              echo "🎯 All instances processed successfully. Hostname setting operations completed."
+
+      - name: Wait for SSM online again (post Doc1 reboot) - new instances only
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+
+              echo "🔍 Starting intelligent monitoring for SSM online detection (post Doc1 reboot)..."
+              for id in $IDS; do
+                echo "Instance: $id"
+
+                ELAPSED=0
+                MAX_WAIT=900  # 15 minutes maximum for post-reboot SSM
+                CHECK_INTERVAL=15  # Start with 15-second intervals
+                EXTEND_THRESHOLD=300  # After 5 minutes, increase interval
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  status=$(aws ssm describe-instance-information \
+                    --filters "Key=InstanceIds,Values=$id" \
+                    --query "InstanceInformationList[0].PingStatus" \
+                    --output text 2>/dev/null || echo "Unknown")
+
+                  if [[ "$status" == "Online" ]]; then
+                    echo "✅ SSM online again: $id (${ELAPSED}s elapsed)"
+                    break
+                  fi
+
+                  # Adaptive interval: longer waits after initial period
+                  if [ $ELAPSED -gt $EXTEND_THRESHOLD ]; then
+                    CHECK_INTERVAL=30  # Switch to 30-second intervals after 5 minutes
+                  fi
+
+                  echo "⏳ SSM status: $status (${ELAPSED}s elapsed, checking every ${CHECK_INTERVAL}s)"
+                  sleep $CHECK_INTERVAL
+                  ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                done
+
+                if [[ "$status" != "Online" ]]; then
+                  echo "❌ ERROR: SSM did not come online again for $id after ${ELAPSED}s"
+                  exit 1
+                fi
+              done
+
+      - name: Cooldown after Doc1 (2 minutes)
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' | xargs || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+              echo "Waiting 120 seconds after hostname change/reboot to stabilize..."
+              sleep 120
+
+      - name: Run SSM doc 2 - ad-join-v1 (new instances only)
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+
+              echo "Running ad-join-v1 (with SCCM + Qualys + SolarWinds agents) on:"
+              echo "$IDS"
+
+              CMD_ID=$(aws ssm send-command \
+                --document-name "ad-join-v1" \
+                --instance-ids $(echo "$IDS" | xargs) \
+                --comment "GitHub Actions: ad-join-v1 with agent installations" \
+                --output json | jq -r '.Command.CommandId')
+
+              echo "CommandId: $CMD_ID"
+
+              # Smart monitoring approach: continuous status checking with adaptive intervals
+              for id in $IDS; do
+                echo "🔍 Starting intelligent monitoring for domain join on $id..."
+
+                ELAPSED=0
+                MAX_WAIT=1800  # 30 minutes maximum
+                CHECK_INTERVAL=30  # Start with 30-second intervals
+                EXTEND_THRESHOLD=600  # After 10 minutes, increase interval
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --query 'Status' --output text 2>/dev/null || echo "Unknown")
+
+                  case "$STATUS" in
+                    "Success")
+                      echo "✅ Domain join completed successfully on $id (${ELAPSED}s elapsed)"
+                      break
+                      ;;
+                    "Failed"|"Cancelled"|"Cancelling"|"TimedOut")
+                      echo "❌ Domain join failed with status '$STATUS' on $id after ${ELAPSED}s"
+                      echo "📋 Retrieving detailed status for analysis..."
+                      aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --output json || echo "Could not retrieve details"
+                      echo "🧹 SSM document execution failed - triggering infrastructure cleanup..."
+                      terraform destroy -auto-approve -var-file=a2niacdemo-v8.tfvars
+                      exit 1
+                      ;;
+                    "InProgress"|"Pending"|"InProgressRecovered")
+                      # Adaptive interval: longer waits for longer-running operations
+                      if [ $ELAPSED -gt $EXTEND_THRESHOLD ]; then
+                        CHECK_INTERVAL=60  # Switch to 60-second intervals after 10 minutes
+                      fi
+                      echo "⏳ Domain join in progress on $id (${ELAPSED}s elapsed, checking every ${CHECK_INTERVAL}s)"
+                      sleep $CHECK_INTERVAL
+                      ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      ;;
+                    *)
+                      echo "❓ Unknown status '$STATUS' on $id (${ELAPSED}s elapsed), retrying in ${CHECK_INTERVAL}s..."
+                      sleep $CHECK_INTERVAL
+                      ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                      ;;
+                  esac
+                done
+
+                # Final status report after monitoring period
+                if [ $ELAPSED -ge $MAX_WAIT ]; then
+                  FINAL_STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" --query 'Status' --output text 2>/dev/null || echo "Unknown")
+                  echo "⏰ Domain join monitoring timeout reached for $id (30 minutes). Final status: $FINAL_STATUS"
+                  echo "❌ SSM document execution timeout - triggering infrastructure cleanup..."
+                  terraform destroy -auto-approve -var-file=a2niacdemo-v8.tfvars
+                  exit 1
+                fi
+
+                echo "📊 Domain join monitoring complete for $id - moving to next instance"
+              done
+
+              echo "🎯 All instances processed successfully. Domain join operations completed."
+
+      - name: Wait for SSM online again (post Doc2 domain join reboot) - new instances only
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+
+              echo "🔍 Starting intelligent monitoring for SSM online detection (post Doc2 domain join reboot)..."
+              for id in $IDS; do
+                echo "Instance: $id"
+
+                ELAPSED=0
+                MAX_WAIT=1200  # 20 minutes maximum for post-domain-join SSM
+                CHECK_INTERVAL=15  # Start with 15-second intervals
+                EXTEND_THRESHOLD=600  # After 10 minutes, increase interval
+
+                while [ $ELAPSED -lt $MAX_WAIT ]; do
+                  status=$(aws ssm describe-instance-information \
+                    --filters "Key=InstanceIds,Values=$id" \
+                    --query "InstanceInformationList[0].PingStatus" \
+                    --output text 2>/dev/null || echo "Unknown")
+
+                  if [[ "$status" == "Online" ]]; then
+                    echo "✅ SSM online after domain join: $id (${ELAPSED}s elapsed)"
+                    break
+                  fi
+
+                  # Adaptive interval: longer waits after initial period
+                  if [ $ELAPSED -gt $EXTEND_THRESHOLD ]; then
+                    CHECK_INTERVAL=30  # Switch to 30-second intervals after 10 minutes
+                  fi
+
+                  echo "⏳ SSM status: $status (${ELAPSED}s elapsed, checking every ${CHECK_INTERVAL}s)"
+                  sleep $CHECK_INTERVAL
+                  ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+                done
+
+                if [[ "$status" != "Online" ]]; then
+                  echo "❌ ERROR: SSM did not come online after domain join for $id after ${ELAPSED}s"
+                  exit 1
+                fi
+              done
+
+      - name: Cooldown after Doc2 - Domain join stabilization (2 minutes)
+        run: |
+              set -euo pipefail
+              IDS=$(echo "$NEW_INSTANCE_IDS_JSON" | jq -r '.[]' | xargs || true)
+              if [[ -z "${IDS:-}" ]]; then
+                echo "No new instances to post-configure. Skipping."
+                exit 0
+              fi
+              echo "2-minute stabilization wait after domain join and agent installations..."
+              sleep 120
+
+          # Post-deployment Summary and Logging
+          - name: Deployment Summary
+            run: |
+              echo "🎉 application EC2 deployment completed successfully!"
+              echo "📊 Resources deployed in us-east-2 region"
+              echo "🏷️  Name: application"
+              echo "📁 State file: applications/application/ec2/us-east-2/application.tfstate"
+              echo ""
+              echo "📋 Post-provisioning completed:"
+              echo "  ✓ EC2 instance provisioning"
+              echo "  ✓ Hostname configuration via set-hostname-windows-v1"
+              echo "  ✓ Domain join via ad-join-v1"
+              echo "  ✓ SCCM agent installation"
+              echo "  ✓ Qualys agent installation" 
+              echo "  ✓ SolarWinds agent installation"
+              echo ""
+              echo "🎯 Next steps: Validate instance configuration and agent connectivity"
+
+  drift_detection:
+     name: Infrastructure Drift Detection
+     if: github.event_name == 'schedule'
+     runs-on: ubuntu-latest
+     environment: non-production
+
+     defaults:
+          run:
+            shell: bash
+            working-directory: ${{ needs.resolve-app.outputs.app_dir }}
+
+     env:
+          TF_IN_AUTOMATION: "true"
+          AWS_REGION: ${{ needs.resolve-app.outputs.region }}
+
+     steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+              role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+              aws-region: us-east-2
+              audience: "sts.amazonaws.com"
+
+        - name: Set up Terraform
+          uses: hashicorp/setup-terraform@v3
+          with:
+              terraform_version: "1.13.1"
+
+        - name: Configure Git for private module access
+          run: |
+              git config --global credential.helper store
+              echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
+              git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+            env:
+              REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+#        - name: Switch to Git Reference for Code Pinning
+#          run: |
+#              # Replace relative path with git reference for CI/CD code pinning
+#              sed -i 's|source = "../../../../../v2-modules/ec2"|source = "git::https://github.com/maddipsw/terraform-modules-repo.git//v2-modules/ec2?ref=v1.0.0"|' main.tf
+#              echo "✅ Switched to git reference for code pinning"
+
+        - name: Terraform Init
+          run: terraform init -input=false -no-color
+
+        - name: Infrastructure Drift Detection
+          run: |
+              set -euo pipefail
+              echo "🔍 Checking for infrastructure drift at $(date)..."
+
+              if terraform plan -no-color -input=false -detailed-exitcode -var-file=application.tfvars > drift-plan.out 2>&1; then
+                echo "✅ No drift detected - infrastructure matches configuration"
+                echo "📊 Drift check completed successfully at $(date)"
+              else
+                EXITCODE=$?
+                if [[ $EXITCODE -eq 2 ]]; then
+                  echo "⚠️ DRIFT DETECTED! Infrastructure has changed outside of Terraform"
+                  echo "🚨 Drift detected at $(date)"
+                  echo "--- DRIFT DETAILS ---"
+                  cat drift-plan.out
+                  echo "--- END DRIFT DETAILS ---"
+
+                  # Extract drift detection data
+                  DRIFT_DATA=$(terraform output -json drift_detection_data 2>/dev/null || echo '{}')
+                  echo "📈 Current infrastructure state: $DRIFT_DATA"
+
+                  echo "🔧 Action required: Review and remediate infrastructure drift"
+                  exit 1
+                else
+                  echo "❌ Error running drift detection"
+                  cat drift-plan.out  
+                  exit $EXITCODE
+                fi
+              fi
