@@ -15,8 +15,14 @@ on:
         default: "us-east-2"
         type: string
 
+      app_directory:
+        description: "Specify the folder path containing the .tfvars file"
+        required: true
+        type: string
+        default: "applications/app-name/ec2/aws-region"
+
       confirm_destroy:
-         description: 'Type YES to continue'
+         description: 'Type YES to confirm terraform destroy'
          required: true
          type: string
 
@@ -25,21 +31,23 @@ permissions:
   id-token: write
 
 jobs:
-  terraform-plan-destroy:
-    name: Terraform Plan Destroy
+  terraform-destroy-plan:
+    name: Terraform Destroy Plan
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    outputs:
-      tfplan: ${{ steps.set-plan.outputs.tfplan }}
+
+    env:
+      TF_IN_AUTOMATION: "true"
+      TFPLAN: ${{ inputs.app_name }}.tfplan
 
     steps:
       - name: Validate Confirmation
         run: |
-          if [ "${{ inputs.confirm_destroy }}" != "YES"]; then
+          if [ "${{ inputs.confirm_destroy }}" != "YES" ]; then
             echo "Destroy not confirmed. Exiting."
             exit 1
           fi
-          
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -48,7 +56,7 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+          role-to-assume: ${{ vars.OIDC_ROLE_GITHUB }}
           aws-region: ${{ inputs.aws_region }}
           audience: "sts.amazonaws.com"
 
@@ -57,54 +65,73 @@ jobs:
         with:
           terraform_version: "1.13.1"
 
-      - name: Configure Git for private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
-        env:
-          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
-
       - name: Terraform fmt (check only)
+        working-directory: ${{ inputs.app_directory }}
         run: terraform fmt -check -recursive
 
       - name: Terraform Init
+        working-directory: ${{ inputs.app_directory }}
         run: terraform init -input=false -no-color
 
       - name: Terraform Validate
+        working-directory: ${{ inputs.app_directory }}
         run: terraform validate -no-color
 
-      - name: Terraform Plan (Destroy)
-        run: terraform plan -destroy -no-color -input=false -out=tfplan -target=module.ec2 -var-file=${{ inputs.app_name }}.tfvars
+      - name: terraform-plan
+        working-directory: ${{ inputs.app_directory }}
+        run: terraform plan -destroy -no-color -input=false -out="${{ env.TFPLAN }}" -target=module.ec2 -var-file="${{ inputs.app_name }}.tfvars"
 
       - name: Generate Destroy Summary
+        working-directory: ${{ inputs.app_directory }}
         run: |
-          terraform show -json tfplan > plan.json
+          ls -lah
+          test -f "${{ env.TFPLAN }}"
+          terraform show -json "${{ env.TFPLAN }}" > plan.json
           
           echo "###  Resources to be DESTROYED" > summary.md
+          
           jq -r '
             .resource_changes[]
-            | select (.change.actions | index("delete"))
-            | "- " + .type + "." + .name
+            | select(.change.actions | index("delete"))
+            | .change.before as $b
+            | "- Name: \($b.tags.Name // "N/A")
+              - Instance ID: \($b.id // "N/A")
+              - Instance Type: \($b.instance_type // "N/A")
+              - AZ: \($b.availability_zone // "N/A")
+              - Private IP: \($b.private_ip // "N/A")
+              - Subnet ID: \($b.subnet_id // "N/A")"
           ' plan.json >> summary.md
-          
+
           cat summary.md
+
+      - name: Publish Destroy Summary
+        working-directory: ${{ inputs.app_directory }}
+        run: |
+          echo "## Terraform Destroy Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Plan Artifact
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
-          path: tfplan
+          path: |
+            ${{ inputs.app_directory }}/${{ env.TFPLAN }}
+            ${{ inputs.app_directory }}/summary.md
+          if-no-files-found: error
 
 
-  terraform-apply-destroy:
-    name: Terraform Apply Destroy
+  terraform-destroy-apply:
+    name: Terraform Destroy Apply
     runs-on: ubuntu-latest
-    needs: terraform-plan-destroy
+    needs: terraform-destroy-plan
+    env:
+      TF_IN_AUTOMATION: "true"
+      TFPLAN: ${{ inputs.app_name }}.tfplan
     concurrency:
       group: terraform-destroy-${{ inputs.app_name }}
       cancel-in-progress: false
-    environment: infra-destroy
+    environment: terraform-destroy
 
     steps:
       - name: Checkout repository
@@ -116,11 +143,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan
+          path: ${{ inputs.app_directory }}
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+          role-to-assume: ${{ vars.OIDC_ROLE_GITHUB }}
           aws-region: ${{ inputs.aws_region }}
           audience: "sts.amazonaws.com"
 
@@ -129,28 +157,50 @@ jobs:
         with:
           terraform_version: "1.13.1"
 
-      - name: Configure Git for private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
-        env:
-          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
-
       - name: Terraform Init
+        working-directory: ${{ inputs.app_directory }}
         run: terraform init -input=false -no-color
 
-      - name: Capture pre-destroy instance_ids
+      - name: Terraform Validate
+        working-directory: ${{ inputs.app_directory }}
+        run: terraform validate -no-color
+
+      - name: Disable termination protection on EC2 instances
+        working-directory: ${{ inputs.app_directory }}
         run: |
-          set -euo pipefail
-          OLD=$(terraform state list | grep module.ec2.aws_instance || true)
-          echo "OLD_INSTANCE_IDS=$OLD" >> $GITHUB_ENV
-          echo "Instances before destroy: $OLD"    
+                 set -euo pipefail
+                 
+                 INSTANCE_IDS=$(terraform state pull | jq -r '
+                   .resources[]
+                   | select(.module == "module.ec2")
+                   | select(.type == "aws_instance")
+                   | .instances[]
+                   | .attributes.id
+                 ' | sort -u)
+                 
+                 if [ -z "$INSTANCE_IDS" ]; then
+                   echo "No EC2 instances found in module.ec2"
+                   exit 0
+                 fi
+          
+                 INSTANCE_IDS_ONE_LINE=$(echo "$INSTANCE_IDS" | xargs)
+                 echo "OLD_INSTANCE_IDS=$INSTANCE_IDS_ONE_LINE" >> "$GITHUB_ENV"
+                 echo "Instances before destroy: $INSTANCE_IDS_ONE_LINE"
+                 
+                 for id in $INSTANCE_IDS_ONE_LINE; do
+                   echo "Disabling termination protection for $id"
+                   aws ec2 modify-instance-attribute \
+                     --instance-id "$id" \
+                     --no-disable-api-termination \
+                     --region "${{ inputs.aws_region }}"
+                 done  
 
       - name: Terraform Apply (Destroy)
-        run: terraform apply -no-color -input=false -auto-approve tfplan
+        working-directory: ${{ inputs.app_directory }}
+        run: terraform apply -no-color -input=false -auto-approve "${{ env.TFPLAN }}"
 
       - name: Capture post-destroy instance IDs
+        working-directory: ${{ inputs.app_directory }}
         run: |
           NEW=$(terraform state list | grep module.ec2.aws_instance || true)
           echo "Instances after destroy: $NEW"
