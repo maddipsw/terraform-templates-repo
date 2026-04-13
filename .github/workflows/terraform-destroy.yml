@@ -1,0 +1,156 @@
+name: terraform-destroy
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Enter the Application Name'
+        required: true
+        type: string
+
+      aws_region:
+        description: "Enter the AWS region on which Infra is provisioned"
+        required: true
+        default: "us-east-2"
+        type: string
+
+      confirm_destroy:
+         description: 'Type YES to continue'
+         required: true
+         type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform-plan-destroy:
+    name: Terraform Plan Destroy
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tfplan: ${{ steps.set-plan.outputs.tfplan }}
+
+    steps:
+      - name: Validate Confirmation
+        run: |
+          if [ "${{ inputs.confirm_destroy }}" != "YES"]; then
+            echo "Destroy not confirmed. Exiting."
+            exit 1
+          fi
+          
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+          aws-region: ${{ inputs.aws_region }}
+          audience: "sts.amazonaws.com"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.1"
+
+      - name: Configure Git for private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
+          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Terraform fmt (check only)
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -input=false -no-color
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan (Destroy)
+        run: terraform plan -destroy -no-color -input=false -out=tfplan -target=module.ec2 -var-file=${{ inputs.app_name }}.tfvars
+
+      - name: Generate Destroy Summary
+        run: |
+          terraform show -json tfplan > plan.json
+          
+          echo "###  Resources to be DESTROYED" > summary.md
+          jq -r '
+            .resource_changes[]
+            | select (.change.actions | index("delete"))
+            | "- " + .type + "." + .name
+          ' plan.json >> summary.md
+          
+          cat summary.md
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+
+
+  terraform-apply-destroy:
+    name: Terraform Apply Destroy
+    runs-on: ubuntu-latest
+    needs: terraform-plan-destroy
+    concurrency:
+      group: terraform-destroy-${{ inputs.app_name }}
+      cancel-in-progress: false
+    environment: infra-destroy
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
+          aws-region: ${{ inputs.aws_region }}
+          audience: "sts.amazonaws.com"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.1"
+
+      - name: Configure Git for private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
+          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
+        env:
+          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+
+      - name: Terraform Init
+        run: terraform init -input=false -no-color
+
+      - name: Capture pre-destroy instance_ids
+        run: |
+          set -euo pipefail
+          OLD=$(terraform state list | grep module.ec2.aws_instance || true)
+          echo "OLD_INSTANCE_IDS=$OLD" >> $GITHUB_ENV
+          echo "Instances before destroy: $OLD"    
+
+      - name: Terraform Apply (Destroy)
+        run: terraform apply -no-color -input=false -auto-approve tfplan
+
+      - name: Capture post-destroy instance IDs
+        run: |
+          NEW=$(terraform state list | grep module.ec2.aws_instance || true)
+          echo "Instances after destroy: $NEW"
