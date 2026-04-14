@@ -160,6 +160,7 @@ jobs:
         id: tfplan
         run: |
             set +e
+            pwd
             terraform plan -input=false -no-color -detailed-exitcode -out=$TFPLAN > plan.txt 2>&1
             exit_code=$?
             set -e
@@ -173,6 +174,10 @@ jobs:
             else
             echo "status=Plan failed" >> "$GITHUB_OUTPUT"
             fi
+
+      - name: Unlock on Failure
+        if: steps.tfplan.outcome == 'failure'
+        run: terraform force-unlock -force $(terraform show -json | jq -r .lock_id) || true
 
       - name: Build PR comment
         id: comment
