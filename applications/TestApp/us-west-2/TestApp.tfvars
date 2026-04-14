@@ -1,4 +1,4 @@
-aws_region           = "us-east-2"
+aws_region           = "us-west-2"
 key_name             = "test-tf-key"
 iam_instance_profile = "EC2-Role"
 
