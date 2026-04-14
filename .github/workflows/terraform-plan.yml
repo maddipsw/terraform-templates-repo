@@ -16,36 +16,60 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+#  qualys_iac_scan:
+#    name: Qualys IaC Scan
+#    runs-on: ubuntu-latest
+#    if: github.event_name == 'pull_request'
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v4
+#        with:
+#          fetch-depth: 0
+#
+#      - name: Qualys IaC Scan
+#        uses: Qualys/github_action_qiac@main
+#        timeout-minutes: 2  # Set 2-minute timeout to prevent hanging
+#        continue-on-error: true  # Continue workflow even if scan fails/times out
+#        env:
+#          URL: ${{ secrets.QUALYS_URL }}
+#          UNAME: ${{ secrets.QUALYS_USERNAME }}
+#          PASS: ${{ secrets.QUALYS_PASSWORD }}
+#        with:
+#          policy_name: 'AWS Infrastructure as Code Security Best Practices Policy'
+#          directory: "."
+
   resolve-app:
     runs-on: ubuntu-latest
+#    needs: qualys_iac_scan
     outputs:
       app_name: ${{ steps.resolve.outputs.app_name }}
       app_dir: ${{ steps.resolve.outputs.app_dir }}
+      region: ${{ steps.resolve.outputs.region }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Resolve app from latest commit message
+      - name: Resolve app from PR title
         id: resolve
         shell: bash
         run: |
-          commit_message="$(git log -1 --pretty=%B)"
-          echo "Latest commit message:"
-          echo "$commit_message"
+          pr_title="${{ github.event.pull_request.title }}"
+          echo "PR Title:"
+          echo "$pr_title"
 
-          if [[ "$commit_message" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
+          if [[ "$pr_title" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
             app_name="${BASH_REMATCH[1]}"
           else
-            echo "ERROR: Commit message must include application name in the format - [Application:<app-name>]"
+            echo "ERROR: PR Title must include application name in the format - [Application:<app-name>]"
             exit 1
           fi
 
-          if [[ "$commit_message" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
+          if [[ "$pr_title" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
             region="${BASH_REMATCH[1]}"
           else
-            echo "ERROR: Commit message must include Region details in the format - [Region:<us-east-2/us-east-1>]"
+            echo "ERROR: PR Title must include Region details in the format - [Region:<us-east-2/us-east-1>]"
             exit 1
           fi
 
@@ -86,23 +110,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-            app-id: ${{ secrets.APP_ID }}
-            private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Configure Git for private module access
-        shell: bash
-        run: |
-          git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/maddipsw/".insteadOf "https://github.com/maddipsw/"
+#      - name: Create GitHub App token
+#        id: app-token
+#        uses: actions/create-github-app-token@v1
+#        with:
+#            app-id: ${{ secrets.APP_ID }}
+#            private-key: ${{ secrets.APP_PRIVATE_KEY }}
+#            github-api-url: https://mnfhs.ghe.com/api/v3
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
-          aws-region: us-east-2
+          role-to-assume: ${{ vars.OIDC_ROLE_GITHUB }}
+          aws-region: ${{ env.AWS_REGION }}
           audience: "sts.amazonaws.com"
 
       - name: Set up Terraform
@@ -110,16 +130,25 @@ jobs:
         with:
           terraform_version: "1.13.1"
 
-      - name: Configure Git for private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
-        env:
-          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+#      - name: Configure Git for private module access
+#        run: |
+#           git config --global credential.helper store
+#           echo "https://x-access-token:${{ steps.app-token.outputs.token }}@mnfhs.ghe.com" > ~/.git-credentials
+#           git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@mnfhs.ghe.com/".insteadOf "https://mnfhs.ghe.com/"
+
+#          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@mnfhs.ghe.com" > ~/.git-credentials
+#          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@mnfhs.ghe.com/".insteadOf "https://mnfhs.ghe.com/"
+#        env:
+#          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
 
       - name: Terraform fmt (check only)
         run: terraform fmt -check -recursive
+
+#      - name: Switch to Git Reference for Code Pinning
+#        run: |
+#          # Replace relative path with git reference for CI/CD code pinning
+#          sed -i 's|source = "../../../../../v2-modules/ec2"|source = "git::https://mnfhs.ghe.com/Fairview-HealthServices/fhs-iac-terraform-modules.git//modules/ec2?ref=v1.0.0"|' main.tf
+#          echo "✅ Switched to git reference for code pinning"
 
       - name: Terraform Init
         run: terraform init -input=false -no-color
@@ -131,7 +160,7 @@ jobs:
         id: tfplan
         run: |
             set +e
-            terraform plan -input=false -no-color -detailed-exitcode -out=tfplan > plan.txt 2>&1
+            terraform plan -input=false -no-color -detailed-exitcode -out=$TFPLAN > plan.txt 2>&1
             exit_code=$?
             set -e
                 
@@ -191,6 +220,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan
-          path: v2-workload-accounts/FHS-SBX-INFRA001/ec2/us-east-2/a2niacdemo-v8/a2niacdemo-v8.tfplan
+          path: ${{ needs.resolve-app.outputs.app_dir }}/${{ needs.resolve-app.outputs.app_name }}.tfplan
           retention-days: 5
 
