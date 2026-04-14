@@ -58,9 +58,9 @@ output "drift_detection_data" {
 output "stack_info" {
   description = "Summary information about the stack"
   value = {
-    region          = var.aws_region
-    instance_count  = length(module.ec2_instances)
-    instance_names  = [
+    region         = var.aws_region
+    instance_count = length(module.ec2_instances)
+    instance_names = [
       for key, module in module.ec2_instances :
       module.computed_names
     ]
