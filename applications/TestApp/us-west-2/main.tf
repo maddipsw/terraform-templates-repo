@@ -21,7 +21,7 @@ provider "aws" {
 
 module "ec2_instances" {
   for_each = var.servers
-  source   = "git::https://github.com/maddipsw/terraform-modules-repo.git//modules/ec2?ref=v1.0.0"
+  source   = "git::https://github.com/maddipsw/terraform-modules-repo.git//modules/ec2"
 
   name_prefix              = each.value.name_prefix
   instance_count           = each.value.instance_count
