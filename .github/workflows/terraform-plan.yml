@@ -187,7 +187,7 @@ jobs:
             echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
           
             # Show the plan output for debugging
-            cat plan.txt
+            # cat plan.txt
             
             if [ "$exit_code" -eq 0 ]; then
               echo "status=✅ No changes" >> "$GITHUB_OUTPUT"
@@ -212,7 +212,27 @@ jobs:
         id: comment
         if: always()
         run: |
-            {
+          # Extract plan summary
+          PLAN_SUMMARY=""
+          if [ -f plan.txt ]; then
+            # Get the "Plan: X to add, Y to change, Z to destroy" line
+            PLAN_SUMMARY=$(grep -E "^Plan: [0-9]+ to add, [0-9]+ to change, [0-9]+ to destroy\." plan.txt || echo "")
+            
+            # If no changes
+            if grep -q "No changes. Your infrastructure matches the configuration." plan.txt; then
+              PLAN_SUMMARY="No changes. Infrastructure is up-to-date."
+            fi
+            
+            # Get errors if plan failed
+            if [ "${{ steps.tfplan.outcome }}" = "failure" ]; then
+              ERROR_SUMMARY=$(grep -A 3 "^Error:" plan.txt | head -20 || echo "Plan failed - see workflow logs for details")
+            fi
+          fi
+          
+          # Build Actions URL
+          ACTIONS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          {
             echo 'body<<EOF'
             echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
             echo "## 🏗️ Terraform Plan - ${{ needs.resolve-app.outputs.app_name }}"
@@ -224,33 +244,48 @@ jobs:
             
             # Format check
             if [ "${{ steps.fmt.outcome }}" = "failure" ]; then
-             echo "⚠️ **Format**: Code needs formatting (run \`terraform fmt -recursive\`)"
-             echo ""
+              echo "### ⚠️ Format Issues"
+              echo "Code needs formatting. Run: \`terraform fmt -recursive\`"
+              echo ""
             fi
             
             # Validation results
             if [ "${{ steps.validate.outcome }}" = "failure" ]; then
-             echo "<details><summary>❌ Validation Failed - Click to expand</summary>"
-             echo ""
-             echo '```hcl'
-             cat validate.txt
-             echo '```'
-             echo "</details>"
-             echo ""
+              echo "### ❌ Validation Failed"
+              echo '```'
+              head -20 validate.txt
+              echo '```'
+              echo ""
             fi
             
-            # Plan results
+            # Plan summary only
             if [ -f plan.txt ] && [ "${{ steps.tfplan.outcome }}" != "skipped" ]; then
-             echo "<details><summary>📋 Plan Output - Click to expand</summary>"
-             echo ""
-             echo '```terraform'
-             head -n 1000 plan.txt
-             echo '```'
-             echo "</details>"
+              echo "### 📊 Plan Summary"
+              echo ""
+              
+              if [ -n "$PLAN_SUMMARY" ]; then
+                echo "$PLAN_SUMMARY"
+              else
+                echo "Plan generated successfully"
+              fi
+              
+              # Show errors if failed
+              if [ "${{ steps.tfplan.outcome }}" = "failure" ] && [ -n "$ERROR_SUMMARY" ]; then
+                echo ""
+                echo "**Errors:**"
+                echo '```'
+                echo "$ERROR_SUMMARY"
+                echo '```'
+              fi
+              
+              echo ""
             fi
+            
+            echo "---"
+            echo "➡️ **[View detailed plan in Actions workflow →]($ACTIONS_URL)**"
             
             echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Find existing comment
         id: find_comment
