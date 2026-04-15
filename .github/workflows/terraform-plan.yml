@@ -180,7 +180,7 @@ jobs:
              fi 
              echo "Using tfvars file: $TFVARS_FILE"
           
-            terraform plan -input=false -no-color -detailed-exitcode -var-file="$TFVARS_FILE" -out=$TFPLAN 2>&1 | tee plan.txt
+            terraform plan -input=false -no-color -detailed-exitcode -lock=false -var-file="$TFVARS_FILE" -out=$TFPLAN 2>&1 | tee plan.txt
             exit_code=$?
             set -e
                 
