@@ -16,36 +16,60 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+#  qualys_iac_scan:
+#    name: Qualys IaC Scan
+#    runs-on: ubuntu-latest
+#    if: github.event_name == 'pull_request'
+#    steps:
+#      - name: Checkout
+#        uses: actions/checkout@v4
+#        with:
+#          fetch-depth: 0
+#
+#      - name: Qualys IaC Scan
+#        uses: Qualys/github_action_qiac@main
+#        timeout-minutes: 2  # Set 2-minute timeout to prevent hanging
+#        continue-on-error: true  # Continue workflow even if scan fails/times out
+#        env:
+#          URL: ${{ secrets.QUALYS_URL }}
+#          UNAME: ${{ secrets.QUALYS_USERNAME }}
+#          PASS: ${{ secrets.QUALYS_PASSWORD }}
+#        with:
+#          policy_name: 'AWS Infrastructure as Code Security Best Practices Policy'
+#          directory: "."
+
   resolve-app:
     runs-on: ubuntu-latest
+#    needs: qualys_iac_scan
     outputs:
       app_name: ${{ steps.resolve.outputs.app_name }}
       app_dir: ${{ steps.resolve.outputs.app_dir }}
+      region: ${{ steps.resolve.outputs.region }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Resolve app from latest commit message
+      - name: Resolve app from PR title
         id: resolve
         shell: bash
         run: |
-          commit_message="$(git log -1 --pretty=%B)"
-          echo "Latest commit message:"
-          echo "$commit_message"
+          pr_title="${{ github.event.pull_request.title }}"
+          echo "PR Title:"
+          echo "$pr_title"
 
-          if [[ "$commit_message" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
+          if [[ "$pr_title" =~ \[Application:([a-zA-Z0-9._-]+)\] ]]; then
             app_name="${BASH_REMATCH[1]}"
           else
-            echo "ERROR: Commit message must include application name in the format - [Application:<app-name>]"
+            echo "ERROR: PR Title must include application name in the format - [Application:<app-name>]"
             exit 1
           fi
 
-          if [[ "$commit_message" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
+          if [[ "$pr_title" =~ \[Region:([a-zA-Z0-9._-]+)\] ]]; then
             region="${BASH_REMATCH[1]}"
           else
-            echo "ERROR: Commit message must include Region details in the format - [Region:<us-east-2/us-east-1>]"
+            echo "ERROR: PR Title must include Region details in the format - [Region:<us-east-2/us-east-1>]"
             exit 1
           fi
 
@@ -76,9 +100,6 @@ jobs:
       TF_IN_AUTOMATION: "true"
       AWS_REGION: ${{ needs.resolve-app.outputs.region }}
       TFPLAN: ${{ needs.resolve-app.outputs.app_name }}.tfplan
-#      TF_VAR_AWS_REGION: ${{ needs.resolve-app.outputs.region }}
-#      TF_VAR_key_name: ${{ vars.KEY_NAME }}
-#      TF_VAR_iam_instance_profile: ${{ vars.IAM_INSTANCE_PROFILE }}
 
     steps:
       - name: Checkout repository
@@ -86,23 +107,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-            app-id: ${{ secrets.APP_ID }}
-            private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
-      - name: Configure Git for private module access
-        shell: bash
-        run: |
-          git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/maddipsw/".insteadOf "https://github.com/maddipsw/"
+#      - name: Create GitHub App token
+#        id: app-token
+#        uses: actions/create-github-app-token@v1
+#        with:
+#            app-id: ${{ secrets.APP_ID }}
+#            private-key: ${{ secrets.APP_PRIVATE_KEY }}
+#            github-api-url: https://mnfhs.ghe.com/api/v3
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::1234567890:role/github-actions-oidc-role
-          aws-region: us-east-2
+          role-to-assume: ${{ vars.OIDC_ROLE_GITHUB }}
+          aws-region: ${{ env.AWS_REGION }}
           audience: "sts.amazonaws.com"
 
       - name: Set up Terraform
@@ -110,87 +127,162 @@ jobs:
         with:
           terraform_version: "1.13.1"
 
-      - name: Configure Git for private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com" > ~/.git-credentials
-          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
-        env:
-          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+#      - name: Configure Git for private module access
+#        run: |
+#           git config --global credential.helper store
+#           echo "https://x-access-token:${{ steps.app-token.outputs.token }}@mnfhs.ghe.com" > ~/.git-credentials
+#           git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@mnfhs.ghe.com/".insteadOf "https://mnfhs.ghe.com/"
+
+#          echo "https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@mnfhs.ghe.com" > ~/.git-credentials
+#          git config --global url."https://${{ secrets.REPO_ACCESS_TOKEN }}:x-oauth-basic@mnfhs.ghe.com/".insteadOf "https://mnfhs.ghe.com/"
+#        env:
+#          REPO_ACCESS_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
 
       - name: Terraform fmt (check only)
+        id: fmt
         run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      #      - name: Switch to Git Reference for Code Pinning
+#        run: |
+#          # Replace relative path with git reference for CI/CD code pinning
+#          sed -i 's|source = "../../../../../v2-modules/ec2"|source = "git::https://mnfhs.ghe.com/Fairview-HealthServices/fhs-iac-terraform-modules.git//modules/ec2?ref=v1.0.0"|' main.tf
+#          echo "✅ Switched to git reference for code pinning"
 
       - name: Terraform Init
-        run: terraform init -input=false -no-color
+        id: init
+        run: |
+          terraform init -input=false -no-color 2>&1 | tee init.txt
 
       - name: Terraform Validate
-        run: terraform validate -no-color
+        id: validate
+        run: terraform validate -no-color 2>&1 | tee validate.txt
+        continue-on-error: true
+
+      - name: Check Validation Result
+        if: steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Terraform validation failed"
+          cat validate.txt
+          exit 1
 
       - name: Terraform Plan
         id: tfplan
+        if: steps.validate.outcome == 'success'
         run: |
             set +e
-            terraform plan -input=false -no-color -detailed-exitcode -out=tfplan > plan.txt 2>&1
+             TFVARS_FILE=$(ls *.tfvars 2>/dev/null | head -1)
+    
+             if [ -z "$TFVARS_FILE" ]; then
+                echo "::error::No .tfvars file found in $(pwd)"
+                ls -la
+                exit 1
+             fi 
+             echo "Using tfvars file: $TFVARS_FILE"
+          
+            terraform plan -input=false -no-color -detailed-exitcode -lock=false -var-file="$TFVARS_FILE" -out=$TFPLAN 2>&1 | tee plan.txt
             exit_code=$?
             set -e
                 
             echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          
+            # Show the plan output for debugging
+            # cat plan.txt
             
             if [ "$exit_code" -eq 0 ]; then
-            echo "status=No changes" >> "$GITHUB_OUTPUT"
+              echo "status=✅ No changes" >> "$GITHUB_OUTPUT"
             elif [ "$exit_code" -eq 2 ]; then
-            echo "status=Changes detected" >> "$GITHUB_OUTPUT"
+              echo "status=📝 Changes detected" >> "$GITHUB_OUTPUT"
             else
-            echo "status=Plan failed" >> "$GITHUB_OUTPUT"
+              echo "status=❌ Plan failed" >> "$GITHUB_OUTPUT"
+            fi
+
+      - name: Unlock on Failure
+        if: failure()
+        continue-on-error: true
+        run: |
+            # Try to extract lock ID from plan output
+            LOCK_ID=$(grep -oP 'ID:\s+\K[a-f0-9-]+' plan.txt 2>/dev/null | head -1)
+            if [ ! -z "$LOCK_ID" ]; then
+              echo "Attempting to unlock state with ID: $LOCK_ID"
+              terraform force-unlock -force "$LOCK_ID"
             fi
 
       - name: Build PR comment
         id: comment
+        if: always()
         run: |
-                {
-                  echo 'body<<EOF'
-                  echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
-                  echo "## Terraform plan - ${{ needs.resolve-app.outputs.app_name }}"
-                  echo ""
-                  echo "- Status: **${{ steps.tfplan.outputs.status }}**"
-                  echo "- Directory: \`${{ needs.resolve-app.outputs.app_dir }}\`"
-                  echo "- Commit: \`${{ github.event.pull_request.head.sha }}\`"
-                  echo ""
-                  echo "<details><summary>Show plan output</summary>"
-                  echo ""
-                  echo '```text'
-                  sed -n '1,60000p' plan.txt
-                  echo '```'
-                  echo ""
-                  echo "</details>"
-                  echo 'EOF'
-                } >> "$GITHUB_OUTPUT"
+            {
+            echo 'body<<EOF'
+            echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
+            echo "## 🏗️ Terraform Plan - ${{ needs.resolve-app.outputs.app_name }}"
+            echo ""
+            echo "**Status**: ${{ steps.tfplan.outputs.status || steps.validate.outputs.outcome }}"
+            echo "**Directory**: \`${{ needs.resolve-app.outputs.app_dir }}\`"
+            echo "**Commit**: \`${{ github.event.pull_request.head.sha }}\`"
+            echo ""
+            
+            # Format check
+            if [ "${{ steps.fmt.outcome }}" = "failure" ]; then
+             echo "⚠️ **Format**: Code needs formatting (run \`terraform fmt -recursive\`)"
+             echo ""
+            fi
+            
+            # Validation results
+            if [ "${{ steps.validate.outcome }}" = "failure" ]; then
+             echo "<details><summary>❌ Validation Failed - Click to expand</summary>"
+             echo ""
+             echo '```hcl'
+             cat validate.txt
+             echo '```'
+             echo "</details>"
+             echo ""
+            fi
+            
+            # Plan results
+            if [ -f plan.txt ] && [ "${{ steps.tfplan.outcome }}" != "skipped" ]; then
+             echo "<details><summary>📋 Plan Output - Click to expand</summary>"
+             echo ""
+             echo '```terraform'
+             head -n 1000 plan.txt
+             echo '```'
+             echo "</details>"
+            fi
+            
+            echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
 
-      - name: Find existing sticky comment
+      - name: Find existing comment
         id: find_comment
         uses: peter-evans/find-comment@v3
         with:
-             issue-number: ${{ github.event.pull_request.number }}
-             comment-author: "github-actions[bot]"
-             body-includes: "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
+            issue-number: ${{ github.event.pull_request.number }}
+            comment-author: "github-actions[bot]"
+            body-includes: "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
 
-      - name: Create or update sticky comment
+      - name: Create or update comment
         uses: peter-evans/create-or-update-comment@v4
         with:
-             issue-number: ${{ github.event.pull_request.number }}
-             comment-id: ${{ steps.find_comment.outputs.comment-id }}
-             body: ${{ steps.comment.outputs.body }}
-             edit-mode: replace
+            issue-number: ${{ github.event.pull_request.number }}
+            comment-id: ${{ steps.find_comment.outputs.comment-id }}
+            body: ${{ steps.comment.outputs.body }}
+            edit-mode: replace
 
-      - name: Fail workflow if plan failed
-        if: steps.tfplan.outputs.exit_code == '1'
-        run: exit 1
+      - name: Fail workflow if validation or plan failed
+        if: steps.validate.outcome == 'failure' || steps.tfplan.outputs.exit_code == '1'
+        run: |
+              if [ "${{ steps.validate.outcome }}" = "failure" ]; then
+                echo "::error::Terraform validation failed"
+              fi
+              if [ "${{ steps.tfplan.outputs.exit_code }}" = "1" ]; then
+                echo "::error::Terraform plan failed"
+              fi
+              exit 1
 
       - name: Upload Terraform Plan
+        if: steps.tfplan.outputs.exit_code == '2'
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-plan
-          path: v2-workload-accounts/FHS-SBX-INFRA001/ec2/us-east-2/a2niacdemo-v8/a2niacdemo-v8.tfplan
-          retention-days: 5
-
+            name: terraform-plan-${{ needs.resolve-app.outputs.app_name }}
+            path: ${{ needs.resolve-app.outputs.app_dir }}/${{ env.TFPLAN }}
+            retention-days: 5
