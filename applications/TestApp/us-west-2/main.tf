@@ -32,7 +32,7 @@ module "ec2_instances" {
   instance_types_by_name = each.value.instance_types_by_name
 
   subnet_ids             = each.value.subnet_ids
-  vpc_security_group_ids = each.value.security_group_ids
+  vpc_security_group_ids = each.value.vpc_security_group_ids
   key_name               = var.key_name
   iam_instance_profile   = var.iam_instance_profile
 
