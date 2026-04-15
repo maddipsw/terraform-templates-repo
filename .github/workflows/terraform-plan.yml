@@ -171,7 +171,16 @@ jobs:
         if: steps.validate.outcome == 'success'
         run: |
             set +e
-            terraform plan -input=false -no-color -detailed-exitcode -out=$TFPLAN 2>&1 | tee plan.txt
+             TFVARS_FILE=$(ls *.tfvars 2>/dev/null | head -1)
+    
+             if [ -z "$TFVARS_FILE" ]; then
+                echo "::error::No .tfvars file found in $(pwd)"
+                ls -la
+                exit 1
+             fi 
+             echo "Using tfvars file: $TFVARS_FILE"
+          
+            terraform plan -input=false -no-color -detailed-exitcode -var-file="$TFVARS_FILE" -out=$TFPLAN 2>&1 | tee plan.txt
             exit_code=$?
             set -e
                 
