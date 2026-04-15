@@ -32,7 +32,7 @@ common_volume_tags = {
 
 servers = {
   app = {
-    name_prefix              = "a2ntstappapp"
+    name_prefix              = "a2ntstappapp0"
     ami_id                   = "ami-0952adfd00eb27814"
     instance_count           = 2
     starting_instance_number = 1
@@ -76,7 +76,7 @@ servers = {
   }
 
   web = {
-    name_prefix              = "a2ntstappweb"
+    name_prefix              = "a2ntstappweb0"
     ami_id                   = "ami-0952adfd00eb27814"
     instance_count           = 1
     starting_instance_number = 1
@@ -115,7 +115,7 @@ servers = {
   }
 
   db = {
-    name_prefix              = "a2ntstappsql"
+    name_prefix              = "a2ntstappsql0"
     ami_id                   = "ami-0952adfd00eb27814"
     instance_count           = 1
     starting_instance_number = 1
