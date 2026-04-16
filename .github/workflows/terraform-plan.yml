@@ -413,6 +413,10 @@ jobs:
           
           EOF
 
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          cat summary.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
 
 #      - name: Generate Grouped Resource Summary
 #        id: summary
