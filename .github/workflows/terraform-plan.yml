@@ -251,8 +251,8 @@ jobs:
               continue
             
             rtype = r["type"]
-            before = r["change"].get("before", {})
-            after = r["change"].get("after", {})
+            before = r["change"].get("before" or {}
+            after = r["change"].get("after" or {}
             target = sections[action]
             
             # ---------------------------------------------------
