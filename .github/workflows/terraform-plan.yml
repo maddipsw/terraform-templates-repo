@@ -208,7 +208,7 @@ jobs:
               terraform force-unlock -force "$LOCK_ID"
             fi
 
-            - name: Generate Grouped Resource Summary
+      - name: Generate Grouped Resource Summary
         id: summary
         run: |
           SUMMARY=$(jq -r '
