@@ -182,6 +182,7 @@ jobs:
           
             terraform plan -input=false -no-color -detailed-exitcode -lock=false -var-file="$TFVARS_FILE" -out=$TFPLAN 2>&1 | tee plan.txt
             exit_code=$?
+            terraform show -json $TFPLAN > plan.json
             set -e
                 
             echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
