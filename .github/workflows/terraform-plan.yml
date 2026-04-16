@@ -346,13 +346,13 @@ jobs:
           # Resolve SG names into EC2
           # ---------------------------------------------------
           for section in sections.values():
-          sg_lookup = {sg["id"]: sg["name"] for sg in section["security_groups"]}
+            sg_lookup = {sg["id"]: sg["name"] for sg in section["security_groups"]}
           
-          for inst in section["instances"].values():
-            resolved_sgs = []
-            for sgid in inst["security_groups"]:
-              resolved_sgs.append(sg_lookup.get(sgid, sgid))
-            inst["security_groups"] = resolved_sgs
+            for inst in section["instances"].values():
+              resolved_sgs = []
+              for sgid in inst["security_groups"]:
+                resolved_sgs.append(sg_lookup.get(sgid, sgid))
+              inst["security_groups"] = resolved_sgs
           
           # ---------------------------------------------------
           # Print section helper
