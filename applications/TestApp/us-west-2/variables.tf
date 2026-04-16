@@ -23,7 +23,7 @@ variable "servers" {
       kms_key_id  = optional(string)
     })
 
-    ebs_block_devices = list(object({
+    ebs_block_devices = optional(list(object({
       name_suffix = string
       device_name = string
       volume_type = string
@@ -31,10 +31,20 @@ variable "servers" {
       volume_iops = optional(number)
       throughput  = optional(number)
       kms_key_id  = optional(string)
-    }))
+    })), [])
 
-    tags        = map(string)
-    volume_tags = map(string)
+    ebs_block_devices_by_instance = optional(map(list(object({
+      name_suffix = string
+      device_name = string
+      volume_type = string
+      volume_size = number
+      volume_iops = optional(number)
+      throughput  = optional(number)
+      kms_key_id  = optional(string)
+    }))), {})
+
+    tags        = optional(map(string), {})
+    volume_tags = optional(map(string), {})
   }))
 }
 
