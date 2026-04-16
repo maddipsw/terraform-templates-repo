@@ -209,95 +209,301 @@ jobs:
               terraform force-unlock -force "$LOCK_ID"
             fi
 
-      - name: Generate Grouped Resource Summary
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Generate Enhanced Terraform Summary
         id: summary
         run: |
-          SUMMARY=$(jq -r '
-            def format_resource:
-              if .type == "aws_instance" then
-                "EC2 Instance " +
-                (.change.after.tags.Name // .name) +
-                " (" + (.change.after.instance_type // "unknown") + ")"
-              
-              elif .type == "aws_ebs_volume" then
-                "EBS Volume " +
-                (.change.after.tags.Name // .name) +
-                " (" +
-                ((.change.after.size|tostring) // "?") +
-                " GB " +
-                (.change.after.type // "gp3") +
-                ")"
-              
-              elif .type == "aws_volume_attachment" then
-                "Volume Attachment → " +
-                (.change.after.instance_id // "unknown instance")
-              
-              elif .type == "aws_security_group" then
-                "Security Group " +
-                (.change.after.name // .name) +
-                " (" + (.change.after.vpc_id // "unknown VPC") + ")"
-              
-              elif .type == "aws_lb" then
-                "Load Balancer " +
-                (.change.after.name // .name) +
-                " (" +
-                (.change.after.load_balancer_type // "unknown") +
-                ", " +
-                (if .change.after.internal == true
-                then "internal"
-                else "internet-facing"
-                end) +
-                ")"
-              
-              elif .type == "aws_s3_bucket" then
-                "S3 Bucket " +
-                (.change.after.bucket // .name) +
-                " (" +
-                (.change.after.acl // "private") +
-                ")" 
+          python3 <<EOF > summary.txt
+          import json
           
-              else
-              .type + " " + .name
-              end;
-            {
-              create: [
-                .resource_changes[]
-                | select(.change.actions == ["create"])
-                | "- " + format_resource
-              ],
-              update: [
-                .resource_changes[]
-                | select(.change.actions == ["update"])
-                | "- " + format_resource
-              ],
-              delete: [
-                .resource_changes[]
-                | select(.change.actions == ["delete"])
-                | "- " + format_resource + " 🚨"
-              ],
-              replace: [
-                .resource_changes[]
-                | select(.change.actions == ["delete","create"] or .change.actions == ["create","delete"])
-                | "- " + format_resource + " 🚨"
-              ]
-            }
-            |
-            (
-              "### Terraform Plan Summary\n\n" +
-              (if (.create|length)>0 then "➕ Resources to Create:\n" + (.create|join("\n")) + "\n\n" else "" end) +
-              (if (.update|length)>0 then "✏️ Resources to Modify:\n" + (.update|join("\n")) + "\n\n" else "" end) +
-              (if (.delete|length)>0 then "❌ Resources to Destroy:\n" + (.delete|join("\n")) + "\n\n" else "" end) +
-              (if (.replace|length)>0 then "🔁 Resources to Replace:\n" + (.replace|join("\n")) + "\n\n" else "" end)
-            )
-          ' plan.json)
+          with open("plan.json") as f:
+            data = json.load(f)
+          
+          sections = {
+            "create": {"instances": {}, "volumes": [], "security_groups": [], "load_balancers": [], "s3_buckets": []},
+            "update": {"instances": {}, "volumes": [], "security_groups": [], "load_balancers": [], "s3_buckets": []},
+            "delete": {"instances": {}, "volumes": [], "security_groups": [], "load_balancers": [], "s3_buckets": []},
+            "replace": {"instances": {}, "volumes": [], "security_groups": [], "load_balancers": [], "s3_buckets": []},
+          }
+          
+          def classify_action(actions):
+            if actions == ["create"]:
+              return "create"
+            elif actions == ["update"]:
+              return "update"
+            elif actions == ["delete"]:
+              return "delete"
+            elif actions in [["delete","create"], ["create","delete"]]:
+              return "replace"
+            return None
+          
+          for r in data["resource_changes"]:
+            action = classify_action(r["change"]["actions"])
+            if not action:
+              continue
             
-          if [ -z "$SUMMARY" ]; then
-            SUMMARY="### Terraform Plan Summary\n\nNo changes detected ✅"
-          fi
+            rtype = r["type"]
+            before = r["change"].get("before", {})
+            after = r["change"].get("after", {})
+            target = sections[action]
             
-          echo "summary<<EOF" >> $GITHUB_OUTPUT
-          echo "$SUMMARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+            # ---------------------------------------------------
+            # EC2 Instances
+            # ---------------------------------------------------
+            if rtype == "aws_instance":
+              name = after.get("tags", {}).get("Name") or before.get("tags", {}).get("Name") or r["name"]
+              
+              instance_type_before = before.get("instance_type", "unknown")
+              instance_type_after = after.get("instance_type", "unknown")
+              
+              sg_ids = after.get("vpc_security_group_ids", []) or before.get("vpc_security_group_ids", [])
+              
+              target["instances"][name] = {
+                "instance_type": instance_type_after,
+                "instance_type_before": instance_type_before,
+                "volumes": [],
+                "security_groups": sg_ids
+              }
+            
+            # ---------------------------------------------------
+            # EBS Volumes
+            # ---------------------------------------------------
+            elif rtype == "aws_ebs_volume":
+              vol_name = r.get("index", r["name"])
+              size = after.get("size") or before.get("size") or "?"
+              vtype = after.get("type") or before.get("type") or "gp3"
+              
+              target["volumes"].append({
+                "name": vol_name,
+                "size": size,
+                "type": vtype
+              })
+            
+            # ---------------------------------------------------
+            # Skip volume attachments
+            # ---------------------------------------------------
+            elif rtype == "aws_volume_attachment":
+              continue
+            
+            # ---------------------------------------------------
+            # Security Groups
+            # ---------------------------------------------------
+            elif rtype == "aws_security_group":
+              sg_id = after.get("id") or before.get("id") or r["name"]
+              sg_name = after.get("name") or before.get("name") or r["name"]
+              
+              target["security_groups"].append({
+                "id": sg_id,
+                "name": sg_name
+              })
+            
+            # ---------------------------------------------------
+            # Load Balancers
+            # ---------------------------------------------------
+            elif rtype == "aws_lb":
+              name = after.get("name") or before.get("name") or r["name"]
+              lb_type = after.get("load_balancer_type") or before.get("load_balancer_type") or "unknown"
+              internal = after.get("internal")
+              if internal is None:
+                internal = before.get("internal", False)
+              
+              target["load_balancers"].append({
+                "name": name,
+                "type": lb_type,
+                "scheme": "internal" if internal else "internet-facing"
+              })
+            
+            # ---------------------------------------------------
+            # S3 Buckets
+            # ---------------------------------------------------
+            elif rtype == "aws_s3_bucket":
+              name = after.get("bucket") or before.get("bucket") or r["name"]
+              acl = after.get("acl") or before.get("acl") or "private"
+              
+              target["s3_buckets"].append({
+                "name": name,
+                "acl": acl
+              })
+          
+          # ---------------------------------------------------
+          # Match EBS to EC2
+          # ---------------------------------------------------
+          for section in sections.values():
+            for vol in section["volumes"]:
+              for inst in section["instances"]:
+                if vol["name"].startswith(inst):
+                  section["instances"][inst]["volumes"].append(vol)
+          
+          # ---------------------------------------------------
+          # Resolve SG names into EC2
+          # ---------------------------------------------------
+          for section in sections.values():
+          sg_lookup = {sg["id"]: sg["name"] for sg in section["security_groups"]}
+          
+          for inst in section["instances"].values():
+            resolved_sgs = []
+            for sgid in inst["security_groups"]:
+              resolved_sgs.append(sg_lookup.get(sgid, sgid))
+            inst["security_groups"] = resolved_sgs
+          
+          # ---------------------------------------------------
+          # Print section helper
+          # ---------------------------------------------------
+          def print_section(title, emoji, data, danger=False):
+            has_content = any([
+              data["instances"],
+              data["load_balancers"],
+              data["s3_buckets"]
+            ])
+            if not has_content:
+              return
+          
+            print(f"{emoji} {title}:\n")
+          
+            if data["instances"]:
+              print("EC2 Instances:")
+              for inst, details in data["instances"].items():
+                suffix = " 🚨" if danger else ""
+                print(f"- EC2 Instance {inst} ({details['instance_type']}){suffix}")
+                
+                # Update diff
+                if title == "Resources to Modify":
+                  if details["instance_type_before"] != details["instance_type"]:
+                    print(f" instance_type: {details['instance_type_before']} → {details['instance_type']}")
+                
+                # SGs
+                for sg in details["security_groups"]:
+                  print(f" ├─ Security Group {sg}")
+                
+                # EBS
+                for vol in details["volumes"]:
+                  short_name = vol["name"].replace(inst + "-", "").split("-_")[0]
+                  print(f" └─ EBS Volume {short_name} ({vol['size']} GB {vol['type']})")
+                
+                print()
+          
+            if data["load_balancers"]:
+              print("Load Balancers:")
+              for lb in data["load_balancers"]:
+                suffix = " 🚨" if danger else ""
+                print(f"- Load Balancer {lb['name']} ({lb['type']}, {lb['scheme']}){suffix}")
+              print()
+          
+            if data["s3_buckets"]:
+              print("S3 Buckets:")
+              for s3 in data["s3_buckets"]:
+                suffix = " 🚨" if danger else ""
+                print(f"- S3 Bucket {s3['name']} ({s3['acl']}){suffix}")
+            print()
+          
+          print("### Terraform Plan Summary\n")
+          
+          print_section("Resources to Create", "➕", sections["create"])
+          print_section("Resources to Modify", "✏️", sections["update"])
+          print_section("Resources to Destroy", "❌", sections["delete"], True)
+          print_section("Resources to Replace", "🔁", sections["replace"], True)
+          
+          EOF
+
+
+#      - name: Generate Grouped Resource Summary
+#        id: summary
+#        run: |
+#          SUMMARY=$(jq -r '
+#            def format_resource:
+#              if .type == "aws_instance" then
+#                "EC2 Instance " +
+#                (.change.after.tags.Name // .name) +
+#                " (" + (.change.after.instance_type // "unknown") + ")"
+#
+#              elif .type == "aws_ebs_volume" then
+#                "EBS Volume " +
+#                (.change.after.tags.Name // .name) +
+#                " (" +
+#                ((.change.after.size|tostring) // "?") +
+#                " GB " +
+#                (.change.after.type // "gp3") +
+#                ")"
+#
+#              elif .type == "aws_volume_attachment" then
+#                "Volume Attachment → " +
+#                (.change.after.instance_id // "unknown instance")
+#
+#              elif .type == "aws_security_group" then
+#                "Security Group " +
+#                (.change.after.name // .name) +
+#                " (" + (.change.after.vpc_id // "unknown VPC") + ")"
+#
+#              elif .type == "aws_lb" then
+#                "Load Balancer " +
+#                (.change.after.name // .name) +
+#                " (" +
+#                (.change.after.load_balancer_type // "unknown") +
+#                ", " +
+#                (if .change.after.internal == true
+#                then "internal"
+#                else "internet-facing"
+#                end) +
+#                ")"
+#
+#              elif .type == "aws_s3_bucket" then
+#                "S3 Bucket " +
+#                (.change.after.bucket // .name) +
+#                " (" +
+#                (.change.after.acl // "private") +
+#                ")"
+#
+#              else
+#              .type + " " + .name
+#              end;
+#
+#            {
+#              create: [
+#                .resource_changes[]
+#                | select(.change.actions == ["create"])
+#                | "- " + format_resource
+#              ],
+#              update: [
+#                .resource_changes[]
+#                | select(.change.actions == ["update"])
+#                | "- " + format_resource
+#              ],
+#              delete: [
+#                .resource_changes[]
+#                | select(.change.actions == ["delete"])
+#                | "- " + format_resource + " 🚨"
+#              ],
+#              replace: [
+#                .resource_changes[]
+#                | select(.change.actions == ["delete","create"] or .change.actions == ["create","delete"])
+#                | "- " + format_resource + " 🚨"
+#              ]
+#            }
+#            |
+#            (
+#              "### Terraform Plan Summary\n\n" +
+#              (if (.create|length)>0 then "➕ Resources to Create:\n" + (.create|join("\n")) + "\n\n" else "" end) +
+#              (if (.update|length)>0 then "✏️ Resources to Modify:\n" + (.update|join("\n")) + "\n\n" else "" end) +
+#              (if (.delete|length)>0 then "❌ Resources to Destroy:\n" + (.delete|join("\n")) + "\n\n" else "" end) +
+#              (if (.replace|length)>0 then "🔁 Resources to Replace:\n" + (.replace|join("\n")) + "\n\n" else "" end)
+#            )
+#          ' plan.json)
+#
+#          if [ -z "$SUMMARY" ]; then
+#            SUMMARY="### Terraform Plan Summary\n\nNo changes detected ✅"
+#          fi
+#
+#          echo "summary<<EOF" >> $GITHUB_OUTPUT
+#          echo "$SUMMARY" >> $GITHUB_OUTPUT
+#          echo "EOF" >> $GITHUB_OUTPUT
         
 
 #      - name: Build PR comment
