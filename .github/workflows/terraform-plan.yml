@@ -259,7 +259,6 @@ jobs:
               else
               .type + " " + .name
               end;
-            
             {
               create: [
                 .resource_changes[]
