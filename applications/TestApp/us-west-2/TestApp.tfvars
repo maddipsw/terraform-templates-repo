@@ -34,9 +34,10 @@ servers = {
   app = {
     name_prefix              = "a2ntstappapp0"
     ami_id                   = "ami-0952adfd00eb27814"
-    instance_count           = 4
+    instance_count           = 2
     starting_instance_number = 1
     default_instance_type    = "t3.medium"
+
     instance_types_by_name = {
       a2ntstappapp001 = "t3.xlarge"
       a2ntstappapp002 = "t3.large"
@@ -52,6 +53,7 @@ servers = {
       throughput  = 125
     }
 
+    # Optional default for every app instance
     ebs_block_devices = [
       {
         name_suffix = "appdata"
@@ -62,6 +64,38 @@ servers = {
         throughput  = 125
       }
     ]
+
+    # New: instance-specific EBS definitions
+    ebs_block_devices_by_instance = {
+        a2ntstappapp001 = [
+          {
+            name_suffix = "appdata"
+            device_name = "/dev/sdf"
+            volume_type = "gp3"
+            volume_size = 150
+            volume_iops = 3000
+            throughput  = 125
+          }
+        ]
+        a2ntstappapp002 = [
+          {
+            name_suffix = "appdata"
+            device_name = "/dev/sdf"
+            volume_type = "gp3"
+            volume_size = 300
+            volume_iops = 6000
+            throughput  = 250
+          },
+          {
+            name_suffix = "applogs"
+            device_name = "/dev/sdg"
+            volume_type = "gp3"
+            volume_size = 120
+            volume_iops = 3000
+            throughput  = 125
+          }
+        ]
+    }
 
     tags = {
       "fv:service-tier" = "Operational Application"
@@ -78,8 +112,8 @@ servers = {
   web = {
     name_prefix              = "a2ntstappweb0"
     ami_id                   = "ami-0952adfd00eb27814"
-    instance_count           = 2
-    starting_instance_number = 2
+    instance_count           = 1
+    starting_instance_number = 1
     default_instance_type    = "t3.medium"
     subnet_ids               = ["subnet-0b9b87586541aa73b"]
     vpc_security_group_ids   = ["sg-0e51c2772cf8a4d1a"]
@@ -117,7 +151,7 @@ servers = {
   db = {
     name_prefix              = "a2ntstappsql0"
     ami_id                   = "ami-0952adfd00eb27814"
-    instance_count           = 1
+    instance_count           = 0
     starting_instance_number = 1
     default_instance_type    = "t3.large"
     subnet_ids               = ["subnet-0c3fa1bf225332a2f"]
