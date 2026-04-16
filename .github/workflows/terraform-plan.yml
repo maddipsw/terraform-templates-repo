@@ -214,13 +214,52 @@ jobs:
         run: |
           SUMMARY=$(jq -r '
             def format_resource:
-              if .type == "aws_lb" then "ALB " + .name
-              elif .type == "aws_security_group" then "Security Group " + .name
-              elif .type == "aws_db_instance" then "RDS " + .name
-              elif .type == "aws_ecs_service" then "ECS Service " + .name
-              elif .type == "aws_iam_role" then "IAM Role " + .name
-              else .type + " " + .name
-              end;            
+              if .type == "aws_instance" then
+                "EC2 Instance " +
+                (.change.after.tags.Name // .name) +
+                " (" + (.change.after.instance_type // "unknown") + ")"
+              
+              elif .type == "aws_ebs_volume" then
+                "EBS Volume " +
+                (.change.after.tags.Name // .name) +
+                " (" +
+                ((.change.after.size|tostring) // "?") +
+                " GB " +
+                (.change.after.type // "gp3") +
+                ")"
+              
+              elif .type == "aws_volume_attachment" then
+                "Volume Attachment → " +
+                (.change.after.instance_id // "unknown instance")
+              
+              elif .type == "aws_security_group" then
+                "Security Group " +
+                (.change.after.name // .name) +
+                " (" + (.change.after.vpc_id // "unknown VPC") + ")"
+              
+              elif .type == "aws_lb" then
+                "Load Balancer " +
+                (.change.after.name // .name) +
+                " (" +
+                (.change.after.load_balancer_type // "unknown") +
+                ", " +
+                (if .change.after.internal == true
+                then "internal"
+                else "internet-facing"
+                end) +
+                ")"
+              
+              elif .type == "aws_s3_bucket" then
+                "S3 Bucket " +
+                (.change.after.bucket // .name) +
+                " (" +
+                (.change.after.acl // "private") +
+                ")" 
+          
+              else
+              .type + " " + .name
+              end;
+            
             {
               create: [
                 .resource_changes[]
