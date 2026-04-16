@@ -50,6 +50,7 @@ module "ec2_instances" {
 
   root_volume       = each.value.root_volume
   ebs_block_devices = each.value.ebs_block_devices
+  ebs_block_devices_by_instance = each.value.ebs_block_devices_by_instance
 
   tags = merge(
     var.common_tags,
