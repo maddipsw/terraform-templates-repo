@@ -208,84 +208,137 @@ jobs:
               terraform force-unlock -force "$LOCK_ID"
             fi
 
-      - name: Build PR comment
-        id: comment
-        if: always()
+            - name: Generate Grouped Resource Summary
+        id: summary
         run: |
-          # Extract plan summary
-          PLAN_SUMMARY=""
-          if [ -f plan.txt ]; then
-            # Get the "Plan: X to add, Y to change, Z to destroy" line
-            PLAN_SUMMARY=$(grep -E "^Plan: [0-9]+ to add, [0-9]+ to change, [0-9]+ to destroy\." plan.txt || echo "")
+          SUMMARY=$(jq -r '
+            def format_resource:
+              if .type == "aws_lb" then "ALB " + .name
+              elif .type == "aws_security_group" then "Security Group " + .name
+              elif .type == "aws_db_instance" then "RDS " + .name
+              elif .type == "aws_ecs_service" then "ECS Service " + .name
+              elif .type == "aws_iam_role" then "IAM Role " + .name
+              else .type + " " + .name
+              end;            
+            {
+              create: [
+                .resource_changes[]
+                | select(.change.actions == ["create"])
+                | "- " + format_resource
+              ],
+              update: [
+                .resource_changes[]
+                | select(.change.actions == ["update"])
+                | "- " + format_resource
+              ],
+              delete: [
+                .resource_changes[]
+                | select(.change.actions == ["delete"])
+                | "- " + format_resource + " 🚨"
+              ],
+              replace: [
+                .resource_changes[]
+                | select(.change.actions == ["delete","create"] or .change.actions == ["create","delete"])
+                | "- " + format_resource + " 🚨"
+              ]
+            }
+            |
+            (
+              "### Terraform Plan Summary\n\n" +
+              (if (.create|length)>0 then "➕ Resources to Create:\n" + (.create|join("\n")) + "\n\n" else "" end) +
+              (if (.update|length)>0 then "✏️ Resources to Modify:\n" + (.update|join("\n")) + "\n\n" else "" end) +
+              (if (.delete|length)>0 then "❌ Resources to Destroy:\n" + (.delete|join("\n")) + "\n\n" else "" end) +
+              (if (.replace|length)>0 then "🔁 Resources to Replace:\n" + (.replace|join("\n")) + "\n\n" else "" end)
+            )
+          ' plan.json)
             
-            # If no changes
-            if grep -q "No changes. Your infrastructure matches the configuration." plan.txt; then
-              PLAN_SUMMARY="No changes. Infrastructure is up-to-date."
-            fi
-            
-            # Get errors if plan failed
-            if [ "${{ steps.tfplan.outcome }}" = "failure" ]; then
-              ERROR_SUMMARY=$(grep -A 3 "^Error:" plan.txt | head -20 || echo "Plan failed - see workflow logs for details")
-            fi
+          if [ -z "$SUMMARY" ]; then
+            SUMMARY="### Terraform Plan Summary\n\nNo changes detected ✅"
           fi
-          
-          # Build Actions URL
-          ACTIONS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          {
-            echo 'body<<EOF'
-            echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
-            echo "## 🏗️ Terraform Plan - ${{ needs.resolve-app.outputs.app_name }}"
-            echo ""
-            echo "**Status**: ${{ steps.tfplan.outputs.status || steps.validate.outputs.outcome }}"
-            echo "**Directory**: \`${{ needs.resolve-app.outputs.app_dir }}\`"
-            echo "**Commit**: \`${{ github.event.pull_request.head.sha }}\`"
-            echo ""
             
-            # Format check
-            if [ "${{ steps.fmt.outcome }}" = "failure" ]; then
-              echo "### ⚠️ Format Issues"
-              echo "Code needs formatting. Run: \`terraform fmt -recursive\`"
-              echo ""
-            fi
-            
-            # Validation results
-            if [ "${{ steps.validate.outcome }}" = "failure" ]; then
-              echo "### ❌ Validation Failed"
-              echo '```'
-              head -20 validate.txt
-              echo '```'
-              echo ""
-            fi
-            
-            # Plan summary only
-            if [ -f plan.txt ] && [ "${{ steps.tfplan.outcome }}" != "skipped" ]; then
-              echo "### 📊 Plan Summary"
-              echo ""
-              
-              if [ -n "$PLAN_SUMMARY" ]; then
-                echo "$PLAN_SUMMARY"
-              else
-                echo "Plan generated successfully"
-              fi
-              
-              # Show errors if failed
-              if [ "${{ steps.tfplan.outcome }}" = "failure" ] && [ -n "$ERROR_SUMMARY" ]; then
-                echo ""
-                echo "**Errors:**"
-                echo '```'
-                echo "$ERROR_SUMMARY"
-                echo '```'
-              fi
-              
-              echo ""
-            fi
-            
-            echo "---"
-            echo "➡️ **[View detailed plan in Actions workflow →]($ACTIONS_URL)**"
-            
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        
+
+#      - name: Build PR comment
+#        id: comment
+#        if: always()
+#        run: |
+#          # Extract plan summary
+#          PLAN_SUMMARY=""
+#          if [ -f plan.txt ]; then
+#            # Get the "Plan: X to add, Y to change, Z to destroy" line
+#            PLAN_SUMMARY=$(grep -E "^Plan: [0-9]+ to add, [0-9]+ to change, [0-9]+ to destroy\." plan.txt || echo "")
+#
+#            # If no changes
+#            if grep -q "No changes. Your infrastructure matches the configuration." plan.txt; then
+#              PLAN_SUMMARY="No changes. Infrastructure is up-to-date."
+#            fi
+#
+#            # Get errors if plan failed
+#            if [ "${{ steps.tfplan.outcome }}" = "failure" ]; then
+#              ERROR_SUMMARY=$(grep -A 3 "^Error:" plan.txt | head -20 || echo "Plan failed - see workflow logs for details")
+#            fi
+#          fi
+#
+#          # Build Actions URL
+#          ACTIONS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+#
+#          {
+#            echo 'body<<EOF'
+#            echo "<!-- terraform-plan:${{ needs.resolve-app.outputs.app_name }} -->"
+#            echo "## 🏗️ Terraform Plan - ${{ needs.resolve-app.outputs.app_name }}"
+#            echo ""
+#            echo "**Status**: ${{ steps.tfplan.outputs.status || steps.validate.outputs.outcome }}"
+#            echo "**Directory**: \`${{ needs.resolve-app.outputs.app_dir }}\`"
+#            echo "**Commit**: \`${{ github.event.pull_request.head.sha }}\`"
+#            echo ""
+#
+#            # Format check
+#            if [ "${{ steps.fmt.outcome }}" = "failure" ]; then
+#              echo "### ⚠️ Format Issues"
+#              echo "Code needs formatting. Run: \`terraform fmt -recursive\`"
+#              echo ""
+#            fi
+#
+#            # Validation results
+#            if [ "${{ steps.validate.outcome }}" = "failure" ]; then
+#              echo "### ❌ Validation Failed"
+#              echo '```'
+#              head -20 validate.txt
+#              echo '```'
+#              echo ""
+#            fi
+#
+#            # Plan summary only
+#            if [ -f plan.txt ] && [ "${{ steps.tfplan.outcome }}" != "skipped" ]; then
+#              echo "### 📊 Plan Summary"
+#              echo ""
+#
+#              if [ -n "$PLAN_SUMMARY" ]; then
+#                echo "$PLAN_SUMMARY"
+#              else
+#                echo "Plan generated successfully"
+#              fi
+#
+#              # Show errors if failed
+#              if [ "${{ steps.tfplan.outcome }}" = "failure" ] && [ -n "$ERROR_SUMMARY" ]; then
+#                echo ""
+#                echo "**Errors:**"
+#                echo '```'
+#                echo "$ERROR_SUMMARY"
+#                echo '```'
+#              fi
+#
+#              echo ""
+#            fi
+#
+#            echo "---"
+#            echo "➡️ **[View detailed plan in Actions workflow →]($ACTIONS_URL)**"
+#
+#            echo 'EOF'
+#          } >> "$GITHUB_OUTPUT"
 
       - name: Find existing comment
         id: find_comment
@@ -300,7 +353,7 @@ jobs:
         with:
             issue-number: ${{ github.event.pull_request.number }}
             comment-id: ${{ steps.find_comment.outputs.comment-id }}
-            body: ${{ steps.comment.outputs.body }}
+            body: ${{ steps.summary.outputs.summary }}
             edit-mode: replace
 
       - name: Fail workflow if validation or plan failed
